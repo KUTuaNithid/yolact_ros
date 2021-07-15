@@ -1,10 +1,9 @@
 #!/usr/local/bin/python3.7
-
 import roslib
 roslib.load_manifest('yolact_ros')
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), "yolact"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "yolact_edge"))
 import rospy
 import rospkg
 import cv2
@@ -39,6 +38,14 @@ from rospy.numpy_msg import numpy_msg
 
 from dynamic_reconfigure.server import Server as ReconfigureServer
 from yolact_ros.cfg import YolactConfig
+
+from utils.tensorrt import convert_to_tensorrt
+
+import time
+import pyzed.sl as sl
+import logging
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
@@ -88,6 +95,10 @@ class YolactNode:
     self.processing_thread.daemon = True
     self.processing_thread.start()
 
+    self.zed_thread = threading.Thread(target=self.zed_image)
+    self.zed_thread.daemon = True
+    self.zed_thread.start()
+  
     self.image_vis_queue = SynchronizedObject()
     self.visualization_thread = None
     self.unpause_visualization = threading.Event()
@@ -140,8 +151,41 @@ class YolactNode:
 
   def processingLoop(self):
       while True:
+        start_time = time.time()
         cv_image, image_header = self.processing_queue.get()
         self.evalimage(cv_image, image_header)
+        print("FPS: {}".format(1.0 / (time.time() - start_time)))
+
+  def zed_image(self):
+      input_type = sl.InputType()
+      input_type.set_from_camera_id(0)
+      init = sl.InitParameters(input_t=input_type)
+      init.coordinate_units = sl.UNIT.METER
+      init.depth_mode = sl.DEPTH_MODE.ULTRA
+      init.depth_minimum_distance = 0.2
+      cam = sl.Camera()
+      if not cam.is_opened():
+        log.info("Opening ZED Camera...")
+      status = cam.open(init)
+      if status != sl.ERROR_CODE.SUCCESS:
+        log.error(repr(status))
+        exit()
+
+      runtime = sl.RuntimeParameters()
+      runtime.sensing_mode = sl.SENSING_MODE.STANDARD
+      mat = sl.Mat()
+
+      while True:
+        err = cam.grab(runtime)
+        if err == sl.ERROR_CODE.SUCCESS:
+          cam.retrieve_image(mat, sl.VIEW.LEFT)
+          cv_image = mat.get_data()
+          image_header = Header()
+          t = rospy.get_rostime()
+          image_header.stamp = t
+          image_header.frame_id = "camera_left"
+          cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2BGR )
+          self.processing_queue.put_nowait((cv_image, image_header))
 
 
   """
@@ -151,12 +195,12 @@ class YolactNode:
 
   def postprocess_results(self, dets_out, w, h):
       with timer.env('Postprocess'):
-          save = cfg.rescore_bbox
-          cfg.rescore_bbox = True
+          #save = cfg.rescore_bbox
+          #cfg.rescore_bbox = True
           t = postprocess(dets_out, w, h, visualize_lincomb = False,
                                           crop_masks        = self.crop_masks,
                                           score_threshold   = self.score_threshold)
-          cfg.rescore_bbox = save
+          #cfg.rescore_bbox = save
 
       with timer.env('Copy'):
           idx = t[1].argsort(0, descending=True)[:self.top_k]
@@ -305,7 +349,8 @@ class YolactNode:
     with torch.no_grad():
       frame = torch.from_numpy(cv_image).cuda().float()
       batch = FastBaseTransform()(frame.unsqueeze(0))
-      preds = self.net(batch)
+      extras = {"backbone": "full", "interrupt": False, "keep_statistics": False, "moving_statistics": None}
+      preds = self.net(batch, extras=extras)["pred_outs"]
 
       h, w, _ = frame.shape
       classes, scores, boxes, masks = self.postprocess_results(preds, w, h)
@@ -353,6 +398,7 @@ class YolactNode:
           self.image_sub.unregister()
 
         self.use_compressed_image = config.use_compressed_image
+        self.use_zed = config.use_zed
 
         if self.use_compressed_image:
             self.image_topic = config.image_topic + '/compressed'
@@ -360,6 +406,8 @@ class YolactNode:
         else:
             self.image_topic = config.image_topic
             self.image_sub = rospy.Subscriber(self.image_topic, Image, self.callback, queue_size=1, buff_size=2**24)
+            if self.use_zed:
+              self.image_sub.unregister()
         print('Subscribed to ' + self.image_topic)
 
     if level & (1 << 1): # publish_visualization
@@ -398,13 +446,33 @@ class YolactNode:
 
     return config
 
+class YolactInitParams:
+    def __init__(self):
+        self.trained_model = None
+        self.disable_tensorrt = False
+        self.use_fp16_tensorrt = False
+        self.use_tensorrt_safe_mode=False
+        self.calib_images = None
+        self.cuda = True
+        self.trt_batch_size = 1
+
+
 def main(args):
   rospy.init_node('yolact_ros')
   rospack = rospkg.RosPack()
   yolact_path = rospack.get_path('yolact_ros')
+
+  params = YolactInitParams()
   
-  model_path_str = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact/weights/yolact_resnet50_54_800000.pth"))
-  model_path = SavePath.from_str(model_path_str)
+  params.trained_model = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact_edge/weights/yolact_edge_mobilenetv2_54_800000.pth"))
+  params.disable_tensorrt = rospy.get_param('~disable_tensorrt', True)
+  params.use_fp16_tensorrt = rospy.get_param('~use_fp16_tensorrt', False)
+  params.use_tensorrt_safe_mode = rospy.get_param('~use_tensorrt_safe_mode', False)
+  params.calib_images = rospy.get_param('~calib_images', os.path.join(yolact_path, "scripts/yolact_edge/data/coco/calib_images"))
+  params.cuda = rospy.get_param('~cuda', True)
+  params.trt_batch_size = rospy.get_param('~trt_batch_size', 1)
+
+  model_path = SavePath.from_str(params.trained_model)
   set_cfg(model_path.model_name + '_config')
 
   with torch.no_grad():
@@ -412,15 +480,17 @@ def main(args):
       cudnn.fastest = True
       torch.set_default_tensor_type('torch.cuda.FloatTensor')   
 
-      print('Loading model from', model_path_str)
+      print('Loading model from', params.trained_model)
       net = Yolact()
-      net.load_weights(model_path_str)
+      net.load_weights(params.trained_model)
       net.eval()
       print('Done.')
-
+      
+      convert_to_tensorrt(net, cfg, params, transform=BaseTransform())
       net = net.cuda()
       net.detect.use_fast_nms = True
       cfg.mask_proto_debug = False
+      print("convert_to_tensorrt")
 
   ic = YolactNode(net)
   

@@ -39,7 +39,13 @@ from rospy.numpy_msg import numpy_msg
 
 from dynamic_reconfigure.server import Server as ReconfigureServer
 from yolact_ros.cfg import YolactConfig
+import pyzed.sl as sl
 
+import logging
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+import time
 iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
@@ -88,6 +94,10 @@ class YolactNode:
     self.processing_thread.daemon = True
     self.processing_thread.start()
 
+    self.zed_thread = threading.Thread(target=self.zed_image)
+    self.zed_thread.daemon = True
+    self.zed_thread.start()
+
     self.image_vis_queue = SynchronizedObject()
     self.visualization_thread = None
     self.unpause_visualization = threading.Event()
@@ -99,6 +109,7 @@ class YolactNode:
     self.publish_visualization = True
     self.publish_detections = True
     self.display_visualization = False
+    self.use_zed = False
 
     self.display_masks = True
     self.display_bboxes = True
@@ -139,10 +150,54 @@ class YolactNode:
         cv2.waitKey(30)
 
   def processingLoop(self):
+      key = ''
+      # while key != 113:
       while True:
         cv_image, image_header = self.processing_queue.get()
+        start_time = time.time()
+        # print("Get")
+        # cv2.imshow("ZED", cv_image)
+        # key = cv2.waitKey(5)
         self.evalimage(cv_image, image_header)
+        print("FPS: {}".format(1.0 / (time.time() - start_time)))
+      # cv2.destroyAllWindows()
 
+  def zed_image(self):
+      input_type = sl.InputType()
+      input_type.set_from_camera_id(0)
+      init = sl.InitParameters(input_t=input_type)
+      init.coordinate_units = sl.UNIT.METER
+      init.depth_mode = sl.DEPTH_MODE.ULTRA
+      init.depth_minimum_distance = 0.2
+      cam = sl.Camera()
+      if not cam.is_opened():
+        log.info("Opening ZED Camera...")
+      status = cam.open(init)
+      if status != sl.ERROR_CODE.SUCCESS:
+        log.error(repr(status))
+        exit()
+
+      runtime = sl.RuntimeParameters()
+      runtime.sensing_mode = sl.SENSING_MODE.STANDARD
+      mat = sl.Mat()
+      # key=''
+      # while key != 113:
+      while True:
+        err = cam.grab(runtime)
+        if err == sl.ERROR_CODE.SUCCESS:
+          cam.retrieve_image(mat, sl.VIEW.LEFT)
+          cv_image = mat.get_data()
+          image_header = Header()
+          t = rospy.get_rostime()
+          image_header.stamp = t
+          image_header.frame_id = "camera_left"
+          cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2BGR )
+          self.processing_queue.put_nowait((cv_image, image_header))
+          # cv2.imshow("ZED", cv_image)
+          # key = cv2.waitKey(5)
+          # print(key)
+      # print("killed")
+      # cv2.destroyAllWindows()
 
   """
   The functions postprocess_results and prep_display are slightly modified versions
@@ -353,22 +408,27 @@ class YolactNode:
           self.image_sub.unregister()
 
         self.use_compressed_image = config.use_compressed_image
-
+        self.use_zed = config.use_zed
         if self.use_compressed_image:
             self.image_topic = config.image_topic + '/compressed'
             self.image_sub = rospy.Subscriber(self.image_topic, CompressedImage, self.callback, queue_size=1, buff_size=2**24)
         else:
             self.image_topic = config.image_topic
             self.image_sub = rospy.Subscriber(self.image_topic, Image, self.callback, queue_size=1, buff_size=2**24)
+            if self.use_zed:
+              self.image_sub.unregister()
         print('Subscribed to ' + self.image_topic)
 
     if level & (1 << 1): # publish_visualization
         self.publish_visualization = config.publish_visualization
     if level & (1 << 2): # publish_detections
         self.publish_detections = config.publish_detections
+        print("publish_detections", self.publish_detections, config.publish_detections)
     if level & (1 << 3): # display_visualization
         self.display_visualization = config.display_visualization
+        print("display_visualization", self.display_visualization, config.display_visualization)
         if self.display_visualization:
+            print("display_visualization set")
             self.unpause_visualization.set()
             if self.visualization_thread is None: # first time visualization
                 print('Creating thread')
@@ -403,7 +463,7 @@ def main(args):
   rospack = rospkg.RosPack()
   yolact_path = rospack.get_path('yolact_ros')
   
-  model_path_str = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact/weights/yolact_resnet50_54_800000.pth"))
+  model_path_str = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact/weights/yolact_plus_resnet50_54_800000.pth"))
   model_path = SavePath.from_str(model_path_str)
   set_cfg(model_path.model_name + '_config')
 

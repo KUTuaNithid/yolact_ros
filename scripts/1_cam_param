@@ -1,0 +1,25 @@
+#!/usr/local/bin/python3.7
+
+from yolact_ros_msgs.srv import get_camParam, get_camParamResponse
+import rospy
+import roslib
+
+def handle_get_camParam(request):
+    global calibration_params
+    response = get_camParamResponse()
+    response.fx = 668.9038696289062
+    response.fy = 668.9038696289062
+    response.cx = 624.2492065429688
+    response.cy = 372.9521484375
+    response.k1 = 0
+    response.k2 = 0
+    response.p1 = 0
+    response.p2 = 0
+    response.k3 = 0
+    response.focal_x_baseline = 80.26846754505095
+
+    return response
+
+rospy.init_node('yolact_ros')
+rospy.Service('add_two_ints', get_camParam, handle_get_camParam)
+rospy.spin()

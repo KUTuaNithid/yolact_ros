@@ -44,6 +44,9 @@ from utils.tensorrt import convert_to_tensorrt
 import time
 import pyzed.sl as sl
 import logging
+import signal
+import sys
+
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -51,7 +54,15 @@ iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
+cam = sl.Camera()
 
+
+def signal_handler(sig, frame):
+    print("Closed cam")
+    cam.close()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
 class SynchronizedObject:
   def __init__(self):
     self.obj = None
@@ -93,7 +104,7 @@ class YolactNode:
     self.processing_queue = SynchronizedObject()
     self.processing_thread = threading.Thread(target=self.processingLoop)
     self.processing_thread.daemon = True
-    self.processing_thread.start()
+    # self.processing_thread.start()
 
     self.zed_thread = threading.Thread(target=self.zed_image)
     self.zed_thread.daemon = True
@@ -151,10 +162,10 @@ class YolactNode:
 
   def processingLoop(self):
       while True:
-        start_time = time.time()
+        # start_time = time.time()
         cv_image, image_header = self.processing_queue.get()
         self.evalimage(cv_image, image_header)
-        print("FPS: {}".format(1.0 / (time.time() - start_time)))
+        # print("FPS: {}".format(1.0 / (time.time() - start_time)))
 
   def zed_image(self):
       input_type = sl.InputType()
@@ -163,7 +174,6 @@ class YolactNode:
       init.coordinate_units = sl.UNIT.METER
       init.depth_mode = sl.DEPTH_MODE.ULTRA
       init.depth_minimum_distance = 0.2
-      cam = sl.Camera()
       if not cam.is_opened():
         log.info("Opening ZED Camera...")
       status = cam.open(init)
@@ -185,7 +195,8 @@ class YolactNode:
           image_header.stamp = t
           image_header.frame_id = "camera_left"
           cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGRA2BGR )
-          self.processing_queue.put_nowait((cv_image, image_header))
+          self.evalimage(cv_image, image_header)
+          # self.processing_queue.put_nowait((cv_image, image_header))
 
 
   """
@@ -464,11 +475,12 @@ def main(args):
 
   params = YolactInitParams()
   
-  params.trained_model = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact_edge/weights/yolact_edge_mobilenetv2_54_800000.pth"))
+  params.trained_model = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact_edge/weights/yolact_edge_resnet50_54_800000.pth"))
   params.disable_tensorrt = rospy.get_param('~disable_tensorrt', True)
   params.use_fp16_tensorrt = rospy.get_param('~use_fp16_tensorrt', False)
   params.use_tensorrt_safe_mode = rospy.get_param('~use_tensorrt_safe_mode', False)
-  params.calib_images = rospy.get_param('~calib_images', os.path.join(yolact_path, "scripts/yolact_edge/data/coco/calib_images"))
+  params.calib_images = rospy.get_param('~calib_images', os.path.join(yolact_path, "/home/docker/catkin_ws/src/yolact_ros/scripts/yolact_edge/data/coco/calib_images"))
+  # params.calib_images = rospy.get_param('~calib_images', os.path.join(yolact_path, "scripts/yolact_edge/data/YoutubeVIS/calib_images"))
   params.cuda = rospy.get_param('~cuda', True)
   params.trt_batch_size = rospy.get_param('~trt_batch_size', 1)
 

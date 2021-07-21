@@ -422,7 +422,7 @@ def main(args):
 
   params = YolactInitParams()
   
-  params.trained_model = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact_edge/weights/yolact_edge_mobilenetv2_54_800000.pth"))
+  params.trained_model = rospy.get_param('~model_path', os.path.join(yolact_path, "scripts/yolact_edge/weights/yolact_edge_resnet50_54_800000.pth"))
   params.disable_tensorrt = rospy.get_param('~disable_tensorrt', True)
   params.use_fp16_tensorrt = rospy.get_param('~use_fp16_tensorrt', False)
   params.use_tensorrt_safe_mode = rospy.get_param('~use_tensorrt_safe_mode', False)
